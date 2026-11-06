@@ -411,6 +411,9 @@ struct desk_toplevel {
 	 * has"). */
 	bool own_frame;
 	bool fullscreen;
+	/* Bottom-edge Desk Peek state per window. */
+	bool peek_raised;
+	int peek_original_inner_h;
 	int fs_x, fs_y, fs_inner_w, fs_inner_h;   /* where it was before */
 	/* A Wayland client that draws its own frame -- a GTK one with a header
 	 * bar, which says so -- also draws its own shadow round it, in a margin
@@ -641,6 +644,8 @@ struct desk_server {
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
+	struct desk_toplevel *peek_pending;
+	double peek_press_x, peek_press_y;
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
 	struct wl_listener cursor_button;
@@ -12857,6 +12862,7 @@ static void fullscreen_layer_order(struct desk_server *server)
 static void view_set_fullscreen(struct desk_toplevel *view, bool on)
 {
 	struct desk_server *server = view->server;
+	if (on) { view->peek_raised=false; view->peek_original_inner_h=0; }
 	/* the screen it is on, and the whole of that one */
 	struct wlr_output *out = view_screen(view);
 	if (!view->scene_tree || !out || on == view->fullscreen) {
@@ -12917,6 +12923,8 @@ tell:
 
 static void view_toggle_max_now(struct desk_toplevel *view)
 {
+	view->peek_raised=false;
+	view->peek_original_inner_h=0;
 	struct wlr_output *out = view_screen(view);
 	if (!out || !view->scene_tree || view->fullscreen) {
 		return;
@@ -14043,6 +14051,8 @@ static void ua_paint(struct desk_toplevel *view, double u)
 static void view_unfold_finish(struct desk_toplevel *view)
 {
 	struct desk_server *server = view->server;
+	view->peek_raised=false;
+	view->peek_original_inner_h=0;
 	int l, t, r, b;
 	view_insets(view, &l, &t, &r, &b);
 	struct wlr_box to = view->ua_to, from = view->ua_from;
@@ -20498,9 +20508,74 @@ static void desk_hover_off(struct desk_server *server)
 	}
 }
 
+/* DEsk Desk Peek: bottom-edge click and drag are distinguished. */
+#define DESK_PEEK_PX 20
+#define DESK_PEEK_DRAG_PX 4
+static bool desk_peek_eligible(struct desk_toplevel *view)
+{
+    if (!view || !view->scene_tree || !view_framed(view) || view->unmanaged
+        || view->ua_on || view->sizing || view->sheet.phase != SHEET_IDLE)
+        return false;
+    if (view->peek_raised) return true;
+    struct wlr_output *out=view_screen(view);
+    if (!out) return false;
+    struct wlr_box area=max_area(view->server,out);
+    int bottom=area.y+area.height;
+    return abs(view->scene_tree->node.y+view->outer_h-bottom)<=4;
+}
+static void desk_peek_toggle(struct desk_toplevel *view)
+{
+    if (!desk_peek_eligible(view)) return;
+    struct desk_server *server=view->server;
+    int l,t,r,b;
+    view_insets(view,&l,&t,&r,&b);
+    const int inner_h=view->outer_h-t-b;
+    const int inner_w=view->outer_w-l-r;
+    if (inner_w<=0 || inner_h<120) return;
+    int next_h;
+    if (!view->peek_raised) {
+        view->peek_original_inner_h=inner_h;
+        view->peek_raised=true;
+        next_h=inner_h-DESK_PEEK_PX;
+    } else {
+        if (abs(inner_h-(view->peek_original_inner_h-DESK_PEEK_PX))>4) {
+            view->peek_raised=false;
+            view->peek_original_inner_h=0;
+            return;
+        }
+        next_h=view->peek_original_inner_h;
+        view->peek_raised=false;
+        view->peek_original_inner_h=0;
+    }
+    const int x0=view->scene_tree->node.x+l;
+    const int y0=view->scene_tree->node.y+t;
+    view_sizing_move(view,x0,y0,x0+inner_w,y0+next_h,WLR_EDGE_BOTTOM);
+    view->sz_released=real_sec();
+    server_schedule_frames(server);
+}
+
 static void process_cursor_motion(struct desk_server *server, uint32_t time)
 {
 	desk_sound_awake();
+	if (server->peek_pending) {
+		const double dx=server->cursor->x-server->peek_press_x;
+		const double dy=server->cursor->y-server->peek_press_y;
+		if (fabs(dx)>DESK_PEEK_DRAG_PX || fabs(dy)>DESK_PEEK_DRAG_PX) {
+			struct desk_toplevel *view=server->peek_pending;
+			server->peek_pending=NULL;
+			if (view->scene_tree && !view->fullscreen) {
+				view->peek_raised=false;
+				view->peek_original_inner_h=0;
+				begin_interactive(view,DESK_CUR_RESIZE,WLR_EDGE_BOTTOM);
+				if (server->cursor_mode==DESK_CUR_RESIZE) {
+					server->grab_x-=dx;
+					server->grab_y-=dy;
+					process_cursor_resize(server);
+				}
+			}
+		}
+		return;
+	}
 	if (locked(server)) {
 		/* at the door: nothing behind it sees the pointer; the key can
 		 * be taken hold of */
@@ -20810,6 +20885,20 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 			lock_submit(server);
 		}
 		return;
+	}
+	if (server->peek_pending) {
+		if (event->button==BTN_LEFT &&
+		    event->state==WL_POINTER_BUTTON_STATE_RELEASED) {
+			struct desk_toplevel *view=server->peek_pending;
+			server->peek_pending=NULL;
+			desk_peek_toggle(view);
+			process_cursor_motion(server,event->time_msec);
+			return;
+		}
+		if (event->state==WL_POINTER_BUTTON_STATE_PRESSED) {
+			server->peek_pending=NULL;
+			return;
+		}
 	}
 	if (console_dying(server)) {
 		return;
@@ -21187,6 +21276,13 @@ static void paper_press(struct desk_server *server, struct wlr_pointer_button_ev
 			int edges = desk_frame_resize_edges(lx, ly, toplevel->outer_w,
 				toplevel->outer_h);
 			if (edges) {
+				if (event->button == BTN_LEFT && edges == WLR_EDGE_BOTTOM
+				    && desk_peek_eligible(toplevel)) {
+					server->peek_pending=toplevel;
+					server->peek_press_x=server->cursor->x;
+					server->peek_press_y=server->cursor->y;
+					return;
+				}
 				begin_interactive(toplevel, DESK_CUR_RESIZE, (uint32_t)edges);
 				return;
 			}
@@ -22144,6 +22240,9 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data)
 	struct desk_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
 	(void)data;
 	struct desk_server *server = toplevel->server;
+	if (server->peek_pending==toplevel) server->peek_pending=NULL;
+	toplevel->peek_raised=false;
+	toplevel->peek_original_inner_h=0;
 	if (toplevel->ime_popup) {
 		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
 		if (server->seat->keyboard_state.focused_surface == view_surface(toplevel)) {
@@ -22236,6 +22335,7 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data)
 	struct desk_toplevel *toplevel = wl_container_of(listener, toplevel, destroy);
 	(void)data;
 	struct desk_server *server = toplevel->server;
+	if (server->peek_pending==toplevel) server->peek_pending=NULL;
 	for (size_t i = 0; i < sizeof server->ime_win / sizeof *server->ime_win; i++) {
 		if (server->ime_win[i] == toplevel) {
 			server->ime_win[i] = NULL;
@@ -22748,6 +22848,9 @@ static void xview_map(struct wl_listener *listener, void *data)
 static void xview_unmap_now(struct desk_toplevel *view)
 {
 	struct desk_server *server = view->server;
+	if (server->peek_pending==view) server->peek_pending=NULL;
+	view->peek_raised=false;
+	view->peek_original_inner_h=0;
 	if (!view->scene_tree) {
 		return;
 	}
