@@ -693,6 +693,11 @@ struct desk_server {
 	struct wl_listener start_drag;
 	struct wl_listener drag_icon_gone;
 	struct wlr_scene_tree *layer_drag;
+	struct wlr_scene_tree *ux_switch_layer;
+	struct wlr_scene_buffer *ux_switch_node;
+	bool ux_switch_active;
+	int ux_switch_count, ux_switch_sel;
+	struct desk_toplevel *ux_switch_items[48];
 	/* a button held down in a program: the pointer stays the program's
 	 * until it is let go (pointer_hold) -- the surface it went down on,
 	 * and the buttons the hand has down, whoever was told of them */
@@ -16491,6 +16496,131 @@ static bool window_under(struct desk_server *server)
 /* A game may occupy the fullscreen layer above the whole desk. On an
  * explicit application switch, return it to its sheet before raising the
  * next app, or the new window would remain hidden under the game. */
+/* DEsk visual Alt+Tab switcher (experimental). */
+#define DESK_UX_MAX_ITEMS 48
+static bool desk_ux_view_alive(struct desk_server *server, const struct desk_toplevel *v)
+{
+    struct desk_toplevel *it;
+    wl_list_for_each(it, &server->toplevels, link)
+        if (it == v) return true;
+    return false;
+}
+static void desk_ux_switch_paint(struct desk_server *s)
+{
+    if (!s->ux_switch_active || !s->ux_switch_layer) return;
+    struct wlr_output *out = screen_at(s, s->cursor->x, s->cursor->y);
+    struct wlr_box a = {0,0,s->desk_w,s->desk_h};
+    if (out) wlr_output_layout_get_box(s->output_layout,out,&a);
+    if (a.width < 240 || a.height < 180) return;
+    int n=s->ux_switch_count;
+    int visible=n < 9 ? n : 9;
+    int width=a.width-48 < 480 ? a.width-48 : 480;
+    int height=56+visible*40;
+    if (height>a.height-28) height=a.height-28;
+    struct desk_buf *b=buf_create(width,height);
+    cairo_t *cr=b->cr;
+    cairo_set_source_rgba(cr,0.10,0.075,0.055,0.96);
+    cairo_rectangle(cr,0,0,width,height);
+    cairo_fill(cr);
+    cairo_set_source_rgb(cr,0.76,0.61,0.40);
+    cairo_set_line_width(cr,2.0);
+    cairo_rectangle(cr,1,1,width-2,height-2);
+    cairo_stroke(cr);
+    cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr,17);
+    cairo_move_to(cr,20,29);
+    cairo_set_source_rgb(cr,0.94,0.85,0.68);
+    cairo_show_text(cr,"WINDOWS  /  ALT+TAB");
+    int first=s->ux_switch_sel >= visible ? s->ux_switch_sel-visible+1 : 0;
+    if (first > n-visible) first = n-visible;
+    if (first < 0) first=0;
+    for (int i=first;i<n && i<first+visible;i++) {
+        int y=44+(i-first)*40;
+        if (y+40>height) break;
+        bool selected=(i==s->ux_switch_sel);
+        if (selected) {
+            cairo_set_source_rgb(cr,0.44,0.30,0.17);
+            cairo_rectangle(cr,10,y,width-20,37);
+            cairo_fill(cr);
+        }
+        cairo_set_source_rgb(cr,selected ? 1.0 : 0.82,selected ? 0.94 : 0.77,
+            selected ? 0.72 : 0.64);
+        cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_NORMAL,
+            selected ? CAIRO_FONT_WEIGHT_BOLD : CAIRO_FONT_WEIGHT_NORMAL);
+        cairo_set_font_size(cr,17);
+        struct desk_toplevel *v=s->ux_switch_items[i];
+        const char *name="(closed)";
+        bool folded=false;
+        if (desk_ux_view_alive(s,v)) {
+            folded=v->sheet.phase!=SHEET_IDLE;
+            name=folded && v->sheet.name[0] ? v->sheet.name : view_title(v);
+        }
+        cairo_save(cr);
+        cairo_rectangle(cr,20,y+2,width-44,34);
+        cairo_clip(cr);
+        cairo_move_to(cr,23,y+26);
+        cairo_show_text(cr,name && *name ? name : "Untitled");
+        cairo_restore(cr);
+        if (folded) {
+            cairo_set_font_size(cr,12);
+            cairo_move_to(cr,width-77,y+25);
+            cairo_show_text(cr,"folded");
+        }
+    }
+    scene_put(&s->ux_switch_node,s->ux_switch_layer,b,
+        a.x+(a.width-width)/2,a.y+(a.height-height)/2,NULL);
+    if (s->ux_switch_node) s->ux_switch_node->point_accepts_input=shadow_accepts;
+    wlr_scene_node_place_below(&s->ux_switch_layer->node,&s->layer_lock->node);
+    wlr_scene_node_set_enabled(&s->ux_switch_layer->node,true);
+    server_schedule_frames(s);
+}
+static void desk_ux_switch_hide(struct desk_server *s)
+{
+    s->ux_switch_active=false;
+    s->ux_switch_count=0;
+    s->ux_switch_sel=0;
+    if (s->ux_switch_layer)
+        wlr_scene_node_set_enabled(&s->ux_switch_layer->node,false);
+    server_schedule_frames(s);
+}
+static void desk_ux_switch_finish(struct desk_server *s,bool accept)
+{
+    struct desk_toplevel *v=NULL;
+    if (accept && s->ux_switch_active && s->ux_switch_sel>=0
+        && s->ux_switch_sel<s->ux_switch_count)
+        v=s->ux_switch_items[s->ux_switch_sel];
+    desk_ux_switch_hide(s);
+    if (!v || !desk_ux_view_alive(s,v) || v->unmanaged || !v->scene_tree) return;
+    struct desk_toplevel *current=view_of_surface(s,
+        s->seat->keyboard_state.focused_surface);
+    if (current && current!=v && current->fullscreen)
+        view_set_fullscreen(current,false);
+    if (v->sheet.phase!=SHEET_IDLE)
+        sheet_begin_unfold(s,&v->sheet);
+    else
+        focus_toplevel(v);
+    server_schedule_frames(s);
+}
+static void desk_ux_switch_step(struct desk_server *s,int dir)
+{
+    if (!s->ux_switch_active) {
+        if (locked(s) || console_dying(s)) return;
+        s->ux_switch_count=0;
+        struct desk_toplevel *v;
+        wl_list_for_each(v,&s->toplevels,link) {
+            if (s->ux_switch_count<DESK_UX_MAX_ITEMS && v->scene_tree
+                && !v->unmanaged && view_takes_keys(v))
+                s->ux_switch_items[s->ux_switch_count++]=v;
+        }
+        if (s->ux_switch_count<2) return;
+        s->ux_switch_active=true;
+        s->ux_switch_sel=0;
+    }
+    int n=s->ux_switch_count;
+    s->ux_switch_sel=(s->ux_switch_sel+dir+n)%n;
+    desk_ux_switch_paint(s);
+}
+
 static void desk_switch_application(struct desk_server *server)
 {
 	struct desk_toplevel *current = view_of_surface(server,
@@ -16524,13 +16654,29 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 	if (console_dying(server)) {
 		return true;
 	}
+	if (server->ux_switch_active && sym == XKB_KEY_Escape) {
+		desk_ux_switch_finish(server,false);
+		return true;
+	}
 	if ((mods & (WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO)) && sym == XKB_KEY_Escape) {
 		end_begin(server, END_LOG_OUT);
 		return true;
 	}
-	/* Alt+Tab should be a compositor shortcut even when a game has focus. */
+	/* Visible Alt+Tab selection, including folded windows. */
+	if (server->ux_switch_active) {
+		if (sym == XKB_KEY_Escape) { desk_ux_switch_finish(server,false); return true; }
+		if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+			desk_ux_switch_finish(server,true); return true;
+		}
+		if (sym == XKB_KEY_Left || sym == XKB_KEY_Up) {
+			desk_ux_switch_step(server,-1); return true;
+		}
+		if (sym == XKB_KEY_Right || sym == XKB_KEY_Down) {
+			desk_ux_switch_step(server,1); return true;
+		}
+	}
 	if ((mods & WLR_MODIFIER_ALT) && sym == XKB_KEY_Tab) {
-		desk_switch_application(server);
+		desk_ux_switch_step(server,(mods & WLR_MODIFIER_SHIFT) ? -1 : 1);
 		return true;
 	}
 	if (card_keys(server, sym)) {
@@ -19078,6 +19224,9 @@ static void keyboard_handle_modifiers(struct wl_listener *listener, void *data)
 {
 	struct desk_keyboard *keyboard = wl_container_of(listener, keyboard, modifiers);
 	(void)data;
+	if (keyboard->server->ux_switch_active &&
+	    !(wlr_keyboard_get_modifiers(keyboard->wlr_keyboard)&WLR_MODIFIER_ALT))
+		desk_ux_switch_finish(keyboard->server,true);
 	wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
 	if (ti_mods_in(keyboard->server, &keyboard->wlr_keyboard->modifiers)) {
 		return;   /* behind a key the input method is answering for */
@@ -19691,6 +19840,26 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data)
 	xkb_keysym_t sym0 = nsyms > 0 ? syms[0] : XKB_KEY_NoSymbol;
 	bool handled = false;
 	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
+	if (server->ux_switch_active) {
+		if ((sym0==XKB_KEY_Alt_L || sym0==XKB_KEY_Alt_R)
+		    && event->state==WL_KEYBOARD_KEY_STATE_RELEASED) {
+			desk_ux_switch_finish(server,true); return;
+		}
+		if (sym0==XKB_KEY_Tab || sym0==XKB_KEY_Left || sym0==XKB_KEY_Right
+		    || sym0==XKB_KEY_Up || sym0==XKB_KEY_Down || sym0==XKB_KEY_Escape
+		    || sym0==XKB_KEY_Return || sym0==XKB_KEY_KP_Enter) {
+			if (event->state==WL_KEYBOARD_KEY_STATE_PRESSED) {
+				if (sym0==XKB_KEY_Escape) desk_ux_switch_finish(server,false);
+				else if (sym0==XKB_KEY_Return || sym0==XKB_KEY_KP_Enter)
+					desk_ux_switch_finish(server,true);
+				else if (sym0==XKB_KEY_Tab)
+					desk_ux_switch_step(server,(modifiers&WLR_MODIFIER_SHIFT) ? -1 : 1);
+				else desk_ux_switch_step(server,
+					(sym0==XKB_KEY_Left||sym0==XKB_KEY_Up) ? -1 : 1);
+			}
+			return;
+		}
+	}
 	/* Ctrl+Alt+F1 and so on: another VT, whatever is going on here, the
 	 * screen lock included */
 	if (sym0 >= XKB_KEY_XF86Switch_VT_1 && sym0 <= XKB_KEY_XF86Switch_VT_12) {
@@ -23743,6 +23912,8 @@ int main(int argc, char **argv)
 	server.cc_pressed = -1;
 	server.layer_top = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_drag = wlr_scene_tree_create(&server.scene->tree);
+	server.ux_switch_layer = wlr_scene_tree_create(&server.scene->tree);
+	wlr_scene_node_set_enabled(&server.ux_switch_layer->node,false);
 	/* and over all of it, the front door when the screen is locked */
 	server.layer_lock = wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_set_enabled(&server.layer_lock->node, false);
