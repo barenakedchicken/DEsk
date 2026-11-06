@@ -620,6 +620,9 @@ struct desk_server {
 	struct wl_list throws;
 	bool quitting;
 	struct wlr_scene_tree *layer_shelf;
+	struct wlr_scene_tree *layer_osd;
+	struct wlr_scene_buffer *osd_node;
+	struct wl_event_source *osd_timer;
 	struct wlr_scene_tree *layer_top;
 
 	struct wlr_xdg_shell *xdg_shell;
@@ -7628,6 +7631,57 @@ static void screen_read(struct desk_server *server)
 
 static void paint_console(struct desk_server *server);
 
+/* Native OSD experiment: above fullscreen, below the screen lock. */
+static int osd_hide_cb(void *data)
+{
+    struct desk_server *s = data;
+    if (s->osd_node) wlr_scene_node_set_enabled(&s->osd_node->node, false);
+    return 0;
+}
+static void osd_show(struct desk_server *s, const char *label, double level)
+{
+    if (!s->layer_osd || s->desk_w < 350 || s->desk_h < 170) return;
+    const int w = 350, h = 90;
+    struct desk_buf *b = buf_create(w, h);
+    cairo_t *cr = b->cr;
+    const double pi = 3.14159265358979323846;
+    cairo_new_path(cr);
+    cairo_arc(cr, 18, 18, 18, pi, 1.5*pi);
+    cairo_arc(cr, w-18, 18, 18, 1.5*pi, 2*pi);
+    cairo_arc(cr, w-18, h-18, 18, 0, pi/2);
+    cairo_arc(cr, 18, h-18, 18, pi/2, pi);
+    cairo_close_path(cr);
+    cairo_set_source_rgba(cr,.11,.075,.045,.91);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr,.85,.65,.37,.8);
+    cairo_set_line_width(cr,1.8);
+    cairo_stroke(cr);
+    cairo_select_font_face(cr,"Sans",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr,20);
+    cairo_set_source_rgb(cr,.99,.91,.72);
+    cairo_move_to(cr,24,38);
+    cairo_show_text(cr,label);
+    if (level >= 0) {
+        level=clampf_d(level,0,1);
+        cairo_set_source_rgba(cr,.91,.81,.63,.24);
+        cairo_rectangle(cr,24,55,w-48,11);
+        cairo_fill(cr);
+        cairo_set_source_rgb(cr,.96,.66,.25);
+        cairo_rectangle(cr,24,55,(w-48)*level,11);
+        cairo_fill(cr);
+    }
+    scene_put(&s->osd_node,s->layer_osd,b,
+        (s->desk_w-w)/2,s->desk_h-h-70,NULL);
+    if (!s->osd_node) return;
+    s->osd_node->point_accepts_input=shadow_accepts;
+    wlr_scene_node_set_enabled(&s->osd_node->node,true);
+    if (!s->osd_timer)
+        s->osd_timer=wl_event_loop_add_timer(
+            wl_display_get_event_loop(s->wl_display),osd_hide_cb,s);
+    if (s->osd_timer) wl_event_source_timer_update(s->osd_timer,1250);
+    server_schedule_frames(s);
+}
+
 /* The brightness keys a laptop has: the screen's light a step -- or, on a
  * machine with no backlight, the lamp over the desk. */
 static void screen_step(struct desk_server *server, int dir)
@@ -7641,6 +7695,7 @@ static void screen_step(struct desk_server *server, int dir)
 		console_dim_apply(server);
 	}
 	paint_console(server);
+	osd_show(server,"BRIGHTNESS",*v);
 	server_schedule_frames(server);
 }
 
@@ -14899,6 +14954,7 @@ static void clock_set_volume(struct desk_server *server, double v)
 		/* the console's knob is the same mixer */
 		server->cc_vol = v;
 		clock_publish(server);
+		osd_show(server,"VOLUME",v);
 	}
 }
 
@@ -19748,6 +19804,18 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data)
 		}
 		return;
 	}
+	if (sym0==XKB_KEY_XF86AudioMicMute) {
+		if (event->state==WL_KEYBOARD_KEY_STATE_PRESSED) {
+			if (on_path("wpctl")) {
+				spawn("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle");
+				osd_show(server,"MICROPHONE TOGGLE",-1);
+			} else if (on_path("pactl")) {
+				spawn("pactl set-source-mute @DEFAULT_SOURCE@ toggle");
+				osd_show(server,"MICROPHONE TOGGLE",-1);
+			}
+		}
+		return;
+	}
 	/* The keyboard's sound and player keys: under Wayland only the desk
 	 * sees them, so they are the desk's, and do what the clock's volume
 	 * and its MEDIA keys do -- the mixer and the player are borrowed. */
@@ -19757,6 +19825,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data)
 			if (sym0 == XKB_KEY_XF86AudioMute) {
 				if (desk_meters_set_muted(2)) {
 					clock_publish(server);
+					osd_show(server,"SPEAKER MUTE TOGGLED",-1);
 				}
 			} else {
 				struct desk_meters m;
@@ -19827,6 +19896,9 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data)
 		}
 	}
 	if (!handled) {
+		if (event->state==WL_KEYBOARD_KEY_STATE_PRESSED && sym0==XKB_KEY_F11
+			&& !(modifiers & (WLR_MODIFIER_LOGO|WLR_MODIFIER_CTRL|WLR_MODIFIER_ALT)))
+			osd_show(server,"FULLSCREEN KEY",-1);
 		wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
 		if (ti_key_in(server, event->keycode, event->state == WL_KEYBOARD_KEY_STATE_PRESSED,
 				sym0, modifiers)) {
@@ -23743,6 +23815,7 @@ int main(int argc, char **argv)
 	server.cc_pressed = -1;
 	server.layer_top = wlr_scene_tree_create(&server.scene->tree);
 	server.layer_drag = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_osd = wlr_scene_tree_create(&server.scene->tree);
 	/* and over all of it, the front door when the screen is locked */
 	server.layer_lock = wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_set_enabled(&server.layer_lock->node, false);
