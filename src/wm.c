@@ -9755,6 +9755,111 @@ static void base_hand_over(struct desk_server *server, struct desk_base *b)
 }
 
 /* The program a window belongs to, by its desktop file id. */
+/* DEsk Steam Game Identity v0.1: match SteamAppId to launchers */
+/* Match only a window's own Steam process to its installed launcher. */
+static pid_t steam_window_pid(const struct desk_toplevel *view)
+{
+    pid_t pid = 0;
+    if (view->xdg_toplevel && view->xdg_toplevel->resource) {
+        wl_client_get_credentials(
+            wl_resource_get_client(view->xdg_toplevel->resource),
+            &pid, NULL, NULL);
+    }
+#ifdef DESK_HAVE_XWAYLAND
+    if (view->xsurface && view->xsurface->pid > 0)
+        pid = view->xsurface->pid;
+#endif
+    return pid;
+}
+static bool steam_id_entry(const char *s, char *out, size_t n)
+{
+    static const char *const keys[] = {
+        "SteamAppId=", "SteamGameId=", "SteamOverlayGameId=",
+        "STEAM_COMPAT_APP_ID="
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        size_t k = strlen(keys[i]);
+        if (strncmp(s, keys[i], k) != 0) continue;
+        const char *p = s + k;
+        size_t d = 0;
+        while (p[d] && d < 20 && isdigit((unsigned char)p[d])) d++;
+        if (d < 1 || d >= n || p[d] || (d == 1 && p[0] == '0'))
+            return false;
+        memcpy(out, p, d);
+        out[d] = '\0';
+        return true;
+    }
+    return false;
+}
+static bool steam_id_from_pid(pid_t pid, char *out, size_t n)
+{
+    if (pid <= 0 || n < 21) return false;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%ld/environ", (long)pid);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char entry[1024];
+    size_t len = 0;
+    bool oversize = false, found = false;
+    for (size_t scanned = 0; scanned < 131072; scanned++) {
+        int c = fgetc(f);
+        if (c == EOF) break;
+        if (c == 0) {
+            if (!oversize) {
+                entry[len] = '\0';
+                if (steam_id_entry(entry, out, n)) {
+                    found = true;
+                    break;
+                }
+            }
+            len = 0;
+            oversize = false;
+        } else if (!oversize && len + 1 < sizeof entry) {
+            entry[len++] = (char)c;
+        } else {
+            oversize = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+static bool steam_exec_game_id(const char *exec, const char *id)
+{
+    if (!exec || !*exec || !id || !*id) return false;
+    static const char *const routes[] = {
+        "steam://rungameid/", "steam://run/", "-applaunch "
+    };
+    const size_t n = strlen(id);
+    for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
+        const char *search = exec, *start;
+        while ((start = strstr(search, routes[i]))) {
+            const char *p = start + strlen(routes[i]);
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, id, n) == 0 &&
+                !isdigit((unsigned char)p[n]))
+                return true;
+            search = start + 1;
+        }
+    }
+    return false;
+}
+static const struct desk_app *steam_app_for_view(
+    const struct desk_app_list *l, const struct desk_toplevel *view)
+{
+    if (!l || !view) return NULL;
+    char game_id[24];
+    if (!steam_id_from_pid(steam_window_pid(view), game_id,
+        sizeof game_id)) return NULL;
+    for (int i = 0; i < l->n; i++) {
+        const struct desk_app *a = &l->apps[i];
+        if (steam_exec_game_id(a->exec, game_id)) return a;
+    }
+    char desktop_id[96];
+    snprintf(desktop_id, sizeof desktop_id, "steam_app_%s.desktop", game_id);
+    const struct desk_app *a = desk_apps_find(l, desktop_id);
+    return a && steam_exec_game_id(a->exec, game_id) ? a : NULL;
+}
+
 static bool view_app_id(const struct desk_toplevel *view, char *out, size_t n)
 {
 	const char *app_id = NULL, *cls = NULL, *inst = NULL;
@@ -9768,7 +9873,8 @@ static bool view_app_id(const struct desk_toplevel *view, char *out, size_t n)
 	}
 #endif
 	const struct desk_app_list *l = desk_apps_acquire();
-	const struct desk_app *app = desk_apps_match(l, app_id, cls, inst);
+	const struct desk_app *app = steam_app_for_view(l, view);
+	if (!app) app = desk_apps_match(l, app_id, cls, inst);
 	if (app) {
 		snprintf(out, n, "%s", app->id);
 	}
@@ -11045,7 +11151,8 @@ static cairo_surface_t *view_app(const struct desk_toplevel *view, char *name, s
 #endif
 	cairo_surface_t *icon = NULL;
 	const struct desk_app_list *l = desk_apps_acquire();
-	const struct desk_app *app = desk_apps_match(l, app_id, cls, inst);
+	const struct desk_app *app = steam_app_for_view(l, view);
+	if (!app) app = desk_apps_match(l, app_id, cls, inst);
 	/* a script's window is called after its file (thing.py), and one that
 	 * calls itself python3 says nothing: its title does better */
 	char stem[128];
