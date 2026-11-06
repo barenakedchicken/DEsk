@@ -402,6 +402,7 @@ struct desk_toplevel {
 	int outer_w, outer_h;
 	int maximized;
 	int saved_x, saved_y, saved_inner_w, saved_inner_h;
+	int ux_snap_side, ux_snap_x, ux_snap_y, ux_snap_w, ux_snap_h;
 	/* No frame of ours: the client draws its own (or asks for none), or
 	 * it has the whole screen. The client then starts at the sheet's
 	 * corner, and the paper is only as big as the client. */
@@ -693,6 +694,7 @@ struct desk_server {
 	struct wl_listener start_drag;
 	struct wl_listener drag_icon_gone;
 	struct wlr_scene_tree *layer_drag;
+	double ux_move_start_x, ux_move_start_y;
 	/* a button held down in a program: the pointer stays the program's
 	 * until it is let go (pointer_hold) -- the surface it went down on,
 	 * and the buttons the hand has down, whoever was told of them */
@@ -12863,6 +12865,7 @@ static void view_set_fullscreen(struct desk_toplevel *view, bool on)
 		goto tell;
 	}
 	if (on) {
+		view->ux_snap_side=0;
 		int l, t, r, b;
 		view_insets(view, &l, &t, &r, &b);
 		struct wlr_box box;
@@ -12917,6 +12920,7 @@ tell:
 
 static void view_toggle_max_now(struct desk_toplevel *view)
 {
+	view->ux_snap_side=0;
 	struct wlr_output *out = view_screen(view);
 	if (!out || !view->scene_tree || view->fullscreen) {
 		return;
@@ -16412,6 +16416,12 @@ static void begin_interactive(struct desk_toplevel *toplevel, enum desk_cursor_m
 	if (!toplevel->scene_tree || toplevel->fullscreen) {
 		return;
 	}
+	if (mode==DESK_CUR_MOVE) {
+		server->ux_move_start_x=server->cursor->x;
+		server->ux_move_start_y=server->cursor->y;
+	}
+	if (toplevel->ux_snap_side && mode==DESK_CUR_RESIZE)
+		toplevel->ux_snap_side=0;
 	server->grabbed = toplevel;
 	server->cursor_mode = mode;
 	if (mode == DESK_CUR_MOVE) {
@@ -16491,6 +16501,66 @@ static bool window_under(struct desk_server *server)
 /* A game may occupy the fullscreen layer above the whole desk. On an
  * explicit application switch, return it to its sheet before raising the
  * next app, or the new window would remain hidden under the game. */
+/* Native half-screen window snapping (experimental). */
+#define DESK_UX_SNAP_EDGE_PX 18
+static void desk_ux_snap(struct desk_toplevel *v,int side,struct wlr_output *out)
+{
+    if (!v || !v->scene_tree || !view_framed(v) || v->unmanaged
+        || v->fullscreen || v->ua_on || v->sheet.phase!=SHEET_IDLE || !out)
+        return;
+    struct desk_server *s=v->server;
+    view_sizing_stop(v);
+    int l,t,r,b;
+    view_insets(v,&l,&t,&r,&b);
+    if (v->maximized) view_toggle_max_now(v);
+    if (v->ux_snap_side==side) {
+        v->ux_snap_side=0;
+        wlr_scene_node_set_position(&v->scene_tree->node,v->ux_snap_x,v->ux_snap_y);
+        view_set_size(v,v->ux_snap_w,v->ux_snap_h);
+    } else {
+        if (!v->ux_snap_side) {
+            v->ux_snap_x=v->scene_tree->node.x;
+            v->ux_snap_y=v->scene_tree->node.y;
+            v->ux_snap_w=v->outer_w-l-r;
+            v->ux_snap_h=v->outer_h-t-b;
+        }
+        struct wlr_box area=max_area(s,out);
+        int left_w=area.width/2;
+        int width=side<0 ? left_w : area.width-left_w;
+        if (width-l-r<100 || area.height-t-b<90) return;
+        int x=side<0 ? area.x : area.x+left_w;
+        v->ux_snap_side=side;
+        wlr_scene_node_set_position(&v->scene_tree->node,x,area.y);
+        view_set_size(v,width-l-r,area.height-t-b);
+    }
+    view_sync_shadow(v);
+    view_send_position(v);
+    server_schedule_frames(s);
+}
+static void desk_ux_snap_shortcut(struct desk_server *s,int side)
+{
+    struct desk_toplevel *v=view_of_surface(s,s->seat->keyboard_state.focused_surface);
+    if (!v || !v->scene_tree) return;
+    desk_ux_snap(v,side,view_screen(v));
+}
+static void desk_ux_snap_drag_end(struct desk_server *s)
+{
+    if (!s->grabbed || s->cursor_mode!=DESK_CUR_MOVE) return;
+    if (fabs(s->cursor->x-s->ux_move_start_x)<8.0
+        && fabs(s->cursor->y-s->ux_move_start_y)<8.0) return;
+    struct wlr_output *out=screen_at(s,s->cursor->x,s->cursor->y);
+    if (!out) return;
+    struct wlr_box area=max_area(s,out);
+    if (s->cursor->y<area.y || s->cursor->y>area.y+area.height) return;
+    int side=0;
+    if (s->cursor->x<=area.x+DESK_UX_SNAP_EDGE_PX) side=-1;
+    if (s->cursor->x>=area.x+area.width-DESK_UX_SNAP_EDGE_PX) side=1;
+    if (side) {
+        if (s->grabbed->ux_snap_side==side) s->grabbed->ux_snap_side=0;
+        desk_ux_snap(s->grabbed,side,out);
+    }
+}
+
 static void desk_switch_application(struct desk_server *server)
 {
 	struct desk_toplevel *current = view_of_surface(server,
@@ -16602,6 +16672,8 @@ static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint
 	}
 	if (mods & WLR_MODIFIER_LOGO) {
 		switch (sym) {
+		case XKB_KEY_Left: desk_ux_snap_shortcut(server,-1); return true;
+		case XKB_KEY_Right: desk_ux_snap_shortcut(server,1); return true;
 		case XKB_KEY_Return:
 			terminal_open();
 			return true;
@@ -20411,6 +20483,24 @@ static void process_cursor_move(struct desk_server *server)
 	if (!toplevel->scene_tree) {
 		return;
 	}
+	if (toplevel->ux_snap_side &&
+	    (fabs(server->cursor->x-server->ux_move_start_x)>5.0 ||
+	     fabs(server->cursor->y-server->ux_move_start_y)>5.0)) {
+		int l,t,r,b;
+		view_insets(toplevel,&l,&t,&r,&b);
+		double rel=(server->cursor->x-toplevel->scene_tree->node.x)/
+		    (toplevel->outer_w>1 ? toplevel->outer_w : 1);
+		if(rel<0.05)rel=0.05;
+		if(rel>0.95)rel=0.95;
+		int x0=(int)(server->cursor->x-rel*(toplevel->ux_snap_w+l+r));
+		int y0=(int)(server->cursor->y-server->grab_y);
+		view_sizing_stop(toplevel);
+		toplevel->ux_snap_side=0;
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,x0,y0);
+		view_set_size(toplevel,toplevel->ux_snap_w,toplevel->ux_snap_h);
+		server->grab_x=server->cursor->x-x0;
+		server->grab_y=server->cursor->y-y0;
+	}
 	int x = (int)(server->cursor->x - server->grab_x);
 	wlr_scene_node_set_position(&toplevel->scene_tree->node, x,
 		work_clamp_y(server, x + toplevel->outer_w / 2,
@@ -20843,6 +20933,7 @@ static void server_cursor_button(struct wl_listener *listener, void *data)
 			server->grabbed->sz_released = real_sec();
 			server_schedule_frames(server);
 		}
+		if (event->button==BTN_LEFT) desk_ux_snap_drag_end(server);
 		reset_cursor_mode(server);
 		wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
 		if (server->held && !server->seat->pointer_state.button_count) {
