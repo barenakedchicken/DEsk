@@ -197,6 +197,7 @@ struct desk_sheet {
 	 * holding a place along the front of it) */
 	bool in_drawer;
 	bool to_drawer;  /* being folded straight into it (Shell Settings) */
+	bool skip_unfold_focus; /* an Alt+Tab target was cycled past */
 	int snd_k;       /* the fold last heard going over (asked for, ahead) */
 	/* its sounds asked for ahead and not yet heard, to be forgotten if
 	 * it turns back; and whether the one for its landing has been */
@@ -2159,6 +2160,7 @@ static void paper_tick(struct desk_server *server)
 }
 
 static void focus_toplevel(struct desk_toplevel *toplevel);
+static void fullscreen_visibility_update(struct desk_server *server);
 static void views_above_raise(struct desk_server *server);
 
 /* DESK_SLOW=n: everything that moves takes n times as long, to be
@@ -2605,9 +2607,10 @@ static void sheet_tick_one(struct desk_server *server, struct desk_sheet *sheet)
 			}
 			desk_fold_free(sheet->fold);
 			sheet->fold = NULL;
-			if (sheet->hit) {
+			if (sheet->hit && !sheet->skip_unfold_focus) {
 				focus_toplevel(sheet->hit);
 			}
+			sheet->skip_unfold_focus = false;
 		}
 	}
 }
@@ -9343,6 +9346,7 @@ static void sheet_begin_unfold(struct desk_server *server, struct desk_sheet *sh
 	if (sheet->phase == SHEET_IDLE) {
 		return;
 	}
+	sheet->skip_unfold_focus = false;
 	/* in the drawer: out of it, from where it lies there; in the hand:
 	 * let go of first */
 	if (sheet->in_drawer) {
@@ -12229,6 +12233,7 @@ static void focus_toplevel(struct desk_toplevel *toplevel)
 	wl_list_remove(&toplevel->link);
 	wl_list_insert(&server->toplevels, &toplevel->link);
 	views_above_raise(server);
+	fullscreen_visibility_update(server);
 	if (!view_takes_keys(toplevel) || prev == surface) {
 		/* raised; the keys stay where they were, or are here already */
 		return;
@@ -12264,6 +12269,7 @@ static void focus_next(struct desk_server *server)
 		}
 	}
 	wlr_seat_keyboard_notify_clear_focus(server->seat);
+	fullscreen_visibility_update(server);
 }
 
 /* The frame's buffer reaches this far past the paper: only far enough
@@ -12851,6 +12857,31 @@ static void fullscreen_layer_order(struct desk_server *server)
 	wlr_scene_node_place_above(&server->layer_xover->node, &server->layer_full->node);
 }
 
+/* DEsk folded-window application switching (experimental) */
+/* Hide a fullscreen scene while a different window on its output has focus. */
+static void fullscreen_visibility_update(struct desk_server *server)
+{
+    struct desk_toplevel *view, *front;
+    wl_list_for_each(view, &server->toplevels, link) {
+        if (!view->fullscreen || !view->scene_tree) continue;
+        bool show = view->sheet.phase == SHEET_IDLE;
+        struct wlr_output *out = view_screen(view);
+        if (show) {
+            wl_list_for_each(front, &server->toplevels, link) {
+                if (!front->scene_tree || front->unmanaged || !view_takes_keys(front)
+                    || (front->sheet.phase != SHEET_IDLE
+                        && front->sheet.phase != SHEET_UNFOLDING)) continue;
+                if (view_screen(front) == out) {
+                    show = front == view;
+                    break;
+                }
+            }
+        }
+        if (view->scene_tree->node.enabled != show)
+            wlr_scene_node_set_enabled(&view->scene_tree->node, show);
+    }
+}
+
 /* The whole screen: off the desk altogether, over everything on it, with
  * no frame and no shadow -- a film, a game, a slide show. And back to the
  * sheet it was, where it was, after. */
@@ -12883,6 +12914,8 @@ static void view_set_fullscreen(struct desk_toplevel *view, bool on)
 	} else {
 		view->fullscreen = false;
 		wlr_scene_node_reparent(&view->scene_tree->node, server->layer_win);
+		if (view->sheet.phase == SHEET_IDLE)
+			wlr_scene_node_set_enabled(&view->scene_tree->node, true);
 		int w = view->fs_inner_w, h = view->fs_inner_h;
 		if (view->maximized) {
 			/* opened out: to all of its screen's desk again, whatever size
@@ -12904,6 +12937,7 @@ static void view_set_fullscreen(struct desk_toplevel *view, bool on)
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
 	fullscreen_layer_order(server);
 tell:
+	fullscreen_visibility_update(server);
 #ifdef DESK_HAVE_XWAYLAND
 	if (view->xsurface) {
 		wlr_xwayland_surface_set_fullscreen(view->xsurface, view->fullscreen);
@@ -16491,29 +16525,29 @@ static bool window_under(struct desk_server *server)
 /* A game may occupy the fullscreen layer above the whole desk. On an
  * explicit application switch, return it to its sheet before raising the
  * next app, or the new window would remain hidden under the game. */
+/* Alt+Tab / Super+Tab: switch to windows or unfold parked packets. */
 static void desk_switch_application(struct desk_server *server)
 {
-	struct desk_toplevel *current = view_of_surface(server,
-		server->seat->keyboard_state.focused_surface);
-	if (!current && !wl_list_empty(&server->toplevels)) {
-		current = wl_container_of(server->toplevels.next, current, link);
-	}
-	struct desk_toplevel *next;
-	wl_list_for_each_reverse(next, &server->toplevels, link) {
-		if (next != current && next->scene_tree && !next->unmanaged
-			&& next->sheet.phase == SHEET_IDLE && view_takes_keys(next)) {
-			if (current && current->fullscreen) {
-				view_set_fullscreen(current, false);
-			}
-			focus_toplevel(next);
-			return;
-		}
-	}
-	/* nothing else to go to: a game alone on the whole screen goes back on
-	 * its sheet, and the desk is there */
-	if (current && current->fullscreen) {
-		view_set_fullscreen(current, false);
-	}
+    if (wl_list_length(&server->toplevels) < 2) return;
+    struct desk_toplevel *current = view_of_surface(server,
+        server->seat->keyboard_state.focused_surface);
+    struct desk_toplevel *next, *other;
+    wl_list_for_each_reverse(next, &server->toplevels, link) {
+        if (next == current || !next->scene_tree || next->unmanaged
+            || !view_takes_keys(next)) continue;
+        wl_list_for_each(other, &server->toplevels, link) {
+            if (other != next && other->sheet.phase == SHEET_UNFOLDING)
+                other->sheet.skip_unfold_focus = true;
+        }
+        if (next->sheet.phase != SHEET_IDLE) {
+            sheet_begin_unfold(server, &next->sheet);
+            next->sheet.skip_unfold_focus = false;
+        }
+        focus_toplevel(next);
+        fullscreen_visibility_update(server);
+        server_schedule_frames(server);
+        return;
+    }
 }
 
 static bool handle_keybinding(struct desk_server *server, xkb_keysym_t sym, uint32_t mods)
@@ -21526,6 +21560,7 @@ static void desk_follow(struct desk_server *server)
 static void output_frame_work(struct desk_server *server)
 {
 	folds_tick(server);
+	fullscreen_visibility_update(server);
 	paper_tick(server);
 	curls_tick(server);
 	sizing_tick(server);
